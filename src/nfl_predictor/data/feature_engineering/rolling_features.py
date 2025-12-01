@@ -145,6 +145,10 @@ def add_rolling_features(
 
     result = (
         result.groupby(group_cols_list, group_keys=False, sort=False)
+        # NOTE: We intentionally do not pass `include_groups=False` here to
+        # keep compatibility with a broad range of pandas versions. The
+        # default behavior is compatible with our usage, even though newer
+        # pandas versions may emit a FutureWarning about group columns.
         .apply(_apply_all_specs)
     )
 

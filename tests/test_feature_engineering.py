@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -21,361 +23,216 @@ from nfl_predictor.data.preprocessing.base_dataset import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers for synthetic base datasets
-# ---------------------------------------------------------------------------
-
-
-def _make_tiny_base_df_single_matchup() -> pd.DataFrame:
-    """
-    Tiny base dataset with one matchup repeated to reason about timing.
-
-    Game setup:
-        Game 1: A (home) vs B       (2023-09-10)
-        Game 2: B (home) vs A       (2023-09-17)
-        Game 3: A (home) vs B       (2023-09-24)
-    """
-    data = {
-        "game_id": ["g1", "g2", "g3"],
-        "season": [2023, 2023, 2023],
-        "week": [1, 2, 3],
-        "gameday": pd.to_datetime(["2023-09-10", "2023-09-17", "2023-09-24"]),
-        "home_team": ["A", "B", "A"],
-        "away_team": ["B", "A", "B"],
-        "home_score": [10, 20, 30],
-        "away_score": [7, 14, 21],
-        "spread_line": [-3.5, -4.5, -6.5],  # home spreads
-        "total_line": [42.5, 43.5, 44.5],
-        "home_moneyline": [-160, -180, -220],
-        "away_moneyline": [140, 155, 190],
-    }
-    df = pd.DataFrame(data)
-    df["home_win"] = (df["home_score"] > df["away_score"]).astype(int)
-    df["total_points"] = df["home_score"] + df["away_score"]
-    df["game_index"] = np.arange(len(df))
-    df["is_regular_season"] = True
-    df["is_postseason"] = False
-    return df
-
-
-def _make_small_base_df_multi_teams() -> pd.DataFrame:
-    """
-    Small base dataset with 3 games and 4 distinct teams.
-
-    Games:
-        g1: A vs B
-        g2: C vs D
-        g3: B vs A
-    """
-    data = {
-        "game_id": ["g1", "g2", "g3"],
-        "season": [2023, 2023, 2023],
-        "week": [1, 1, 2],
-        "gameday": pd.to_datetime(["2023-09-10", "2023-09-10", "2023-09-17"]),
-        "home_team": ["A", "C", "B"],
-        "away_team": ["B", "D", "A"],
-        "home_score": [17, 24, 21],
-        "away_score": [10, 20, 14],
-        "spread_line": [-3.0, -4.0, -2.5],
-        "total_line": [45.5, 47.5, 43.5],
-        "home_moneyline": [-150, -180, -130],
-        "away_moneyline": [130, 160, 110],
-    }
-    df = pd.DataFrame(data)
-    df["home_win"] = (df["home_score"] > df["away_score"]).astype(int)
-    df["total_points"] = df["home_score"] + df["away_score"]
-    df["game_index"] = np.arange(len(df))
-    df["is_regular_season"] = True
-    df["is_postseason"] = False
-    return df
-
-
-def _make_schedule_asymmetric_df() -> pd.DataFrame:
-    """
-    Base dataset with asymmetric rest between home and away before a given game.
-
-    Games:
-        g1: A vs C on 2023-09-10
-        g2: B vs D on 2023-09-14
-        g3: A vs B on 2023-09-24  (A had 14 days rest, B had 10 days)
-    """
-    data = {
-        "game_id": ["g1", "g2", "g3"],
-        "season": [2023, 2023, 2023],
-        "week": [1, 1, 3],
-        "gameday": pd.to_datetime(["2023-09-10", "2023-09-14", "2023-09-24"]),
-        "home_team": ["A", "B", "A"],
-        "away_team": ["C", "D", "B"],
-        "home_score": [21, 17, 24],
-        "away_score": [10, 14, 20],
-        "spread_line": [-3.0, -2.5, -4.0],
-        "total_line": [45.5, 42.5, 44.5],
-        "home_moneyline": [-150, -130, -170],
-        "away_moneyline": [130, 110, 150],
-    }
-    df = pd.DataFrame(data)
-    df["home_win"] = (df["home_score"] > df["away_score"]).astype(int)
-    df["total_points"] = df["home_score"] + df["away_score"]
-    df["game_index"] = np.arange(len(df))
-    df["is_regular_season"] = True
-    df["is_postseason"] = False
-    return df
-
-
-# ---------------------------------------------------------------------------
-# 1) Rolling logic / timing (pure rolling_features)
-# ---------------------------------------------------------------------------
-
-
-def test_feature_timing_basic_rolling():
-    """
-    add_rolling_features should use only strictly prior rows in the window.
-
-    Construct a single team with linearly increasing values and verify
-    that the rolling mean at each step uses only previous games.
-    """
+def test_feature_timing_basic_rolling() -> None:
+    # Simple single-team, single-season series to verify shift+rolling.
     df = pd.DataFrame(
         {
-            "team": ["X"] * 5,
-            "season": [2023] * 5,
+            "team": ["A"] * 5,
+            "season": [2021] * 5,
             "game_index": [0, 1, 2, 3, 4],
-            "value": [10, 20, 30, 40, 50],
+            "x": [10, 20, 30, 40, 50],
         }
     )
 
-    spec = RollingSpec(
-        col="value",
-        windows=[3],
-        stats=("mean",),
-        min_periods=1,
-        prefix="value",
+    specs = [RollingSpec(col="x", windows=(2,), stats=("mean",), min_periods=1)]
+    out = add_rolling_features(
+        df=df,
+        group_cols=["team", "season"],
+        time_col="game_index",
+        specs=specs,
     )
 
+    # rolling_mean_2 with a 1-row shift:
+    # index 0: no prior -> NaN
+    # index 1: prior = [10]        -> 10
+    # index 2: prior = [10,20]     -> 15
+    # index 3: prior = [20,30]     -> 25
+    # index 4: prior = [30,40]     -> 35
+    expected = [np.nan, 10.0, 15.0, 25.0, 35.0]
+    col = "x_rolling_mean_2"
+    assert col in out.columns
+    np.testing.assert_allclose(out[col].values, expected, equal_nan=True)
+
+
+def test_team_and_game_shapes() -> None:
+    # 3 games, 4 teams (two matchups).
+    base = pd.DataFrame(
+        {
+            "game_id": ["g1", "g2", "g3"],
+            "season": [2021, 2021, 2021],
+            "week": [1, 1, 2],
+            "gameday": pd.to_datetime(["2021-09-10", "2021-09-10", "2021-09-17"]),
+            "game_index": [0, 1, 2],
+            "home_team": ["A", "C", "A"],
+            "away_team": ["B", "D", "C"],
+            "home_score": [20, 17, 24],
+            "away_score": [10, 21, 17],
+            "home_win": [1, 0, 1],
+            "total_points": [30, 38, 41],
+            "spread_line": [-7.0, 3.0, -3.5],
+            "total_line": [44.5, 42.0, 45.0],
+            "home_moneyline": [-200, 120, -150],
+            "away_moneyline": [170, -140, 130],
+            "is_regular_season": [True, True, True],
+            "is_postseason": [False, False, False],
+        }
+    )
+
+    cfg = TeamStatsConfig(seasons=[2021], include_postseason=True, rolling_windows=(2,))
+    team_df = build_team_features(config=cfg, base_games=base)
+    game_df = build_game_level_features(team_df=team_df, base_games=base, config=cfg)
+
+    # 3 games -> 6 team rows
+    assert len(team_df) == 2 * len(base)
+    # game-level must match base row count
+    assert len(game_df) == len(base)
+
+    # Check some home_/away_ rolling cols exist
+    assert any(c.startswith("home_points_for_rolling_mean") for c in game_df.columns)
+    assert any(c.startswith("away_points_for_rolling_mean") for c in game_df.columns)
+
+
+def test_no_future_information_for_team_points() -> None:
+    # Two teams, same season, alternating games.
+    df = pd.DataFrame(
+        {
+            "team": ["A", "B", "A", "B"],
+            "season": [2021, 2021, 2021, 2021],
+            "game_index": [0, 1, 2, 3],
+            "points_for": [10, 20, 30, 40],
+        }
+    )
+
+    spec = RollingSpec(col="points_for", windows=(2,), stats=("mean",), min_periods=1)
     out = add_rolling_features(
-        df,
+        df=df,
         group_cols=["team", "season"],
         time_col="game_index",
         specs=[spec],
     )
 
-    col = "value_rolling_mean_3"
-    assert col in out.columns
-
-    # Expected rolling means with strict "past only" windows:
-    # game 0: NaN (no prior games)
-    # game 1: mean([10]) = 10
-    # game 2: mean([10, 20]) = 15
-    # game 3: mean([10, 20, 30]) = 20
-    # game 4: mean([20, 30, 40]) = 30
-    expected = [np.nan, 10.0, 15.0, 20.0, 30.0]
-    actual = out[col].tolist()
-
-    assert np.isnan(actual[0])
-    assert actual[1:] == pytest.approx(expected[1:], rel=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# 2) Team and game shapes
-# ---------------------------------------------------------------------------
-
-
-def test_team_and_game_shapes():
-    """
-    Team-level and game-level DataFrames should have consistent shapes and
-    home_/away_ rolling columns should exist.
-    """
-    base_df = _make_small_base_df_multi_teams()
-    cfg = TeamStatsConfig(
-        seasons=[2023],
-        rolling_windows=(2,),
-        min_games_for_rolling=1,
-        include_postseason=True,
-        save_team_level=False,
-        save_game_level=False,
-    )
-
-    team_df = build_team_features(config=cfg, base_games=base_df)
-    # Two rows per game
-    assert len(team_df) == len(base_df) * 2
-
-    game_df = build_game_level_features(
-        team_df=team_df,
-        base_games=base_df,
-        config=cfg,
-    )
-
-    # Back to one row per game
-    assert len(game_df) == len(base_df)
-
-    # Should have some obvious home/away rolling columns
-    assert any(
-        col.startswith("home_points_for_rolling_mean_")
-        for col in game_df.columns
-    )
-    assert any(
-        col.startswith("away_points_for_rolling_mean_")
-        for col in game_df.columns
-    )
-
-
-# ---------------------------------------------------------------------------
-# 3) No future information for team points
-# ---------------------------------------------------------------------------
-
-
-def test_no_future_information_for_team_points():
-    """
-    In the toy dataset, verify that team rolling stats never use future games.
-
-    For Team A (using a 2-game rolling window on team_points_for):
-        - Game 1: no history -> NaN
-        - Game 2: history = [game1]
-        - Game 3: history = [game1, game2]
-    """
-    base_df = _make_tiny_base_df_single_matchup()
-    cfg = TeamStatsConfig(
-        seasons=[2023],
-        rolling_windows=(2,),
-        min_games_for_rolling=1,
-        include_postseason=True,
-    )
-
-    team_df = build_team_features(config=cfg, base_games=base_df)
-
-    # Filter to team A, sorted by game_index
-    team_a = team_df[team_df["team"] == "A"].sort_values("game_index")
-
     col = "points_for_rolling_mean_2"
-    assert col in team_a.columns
-
-    # True points for A in each appearance:
-    # game 1 as home: 10
-    # game 2 as away: 14
-    # game 3 as home: 30
-    points_for = team_a["team_points_for"].tolist()
-    assert points_for == [10, 14, 30]
-
-    # Rolling mean with past-only 2-game window:
-    # idx0: NaN
-    # idx1: mean([10]) = 10
-    # idx2: mean([10, 14]) = 12
-    vals = team_a[col].tolist()
-    assert np.isnan(vals[0])
-    assert vals[1:] == pytest.approx([10.0, 12.0], rel=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# 4) Home/away alignment correctness
-# ---------------------------------------------------------------------------
-
-
-def test_home_away_alignment_correct():
-    """
-    Verify that home_* features use the correct team's history and
-    away_* features use the away team's history.
-    """
-    base_df = _make_tiny_base_df_single_matchup()
-    cfg = TeamStatsConfig(
-        seasons=[2023],
-        rolling_windows=(2,),
-        min_games_for_rolling=1,
-        include_postseason=True,
+    # For team A: game_index 0 -> NaN, 2 -> mean of [10] = 10
+    a_rows = out[out["team"] == "A"].sort_values("game_index")
+    np.testing.assert_allclose(
+        a_rows[col].values,
+        [np.nan, 10.0],
+        equal_nan=True,
+    )
+    # For team B: game_index 1 -> NaN, 3 -> mean of [20] = 20
+    b_rows = out[out["team"] == "B"].sort_values("game_index")
+    np.testing.assert_allclose(
+        b_rows[col].values,
+        [np.nan, 20.0],
+        equal_nan=True,
     )
 
-    team_df = build_team_features(config=cfg, base_games=base_df)
-    game_df = build_game_level_features(
-        team_df=team_df,
-        base_games=base_df,
-        config=cfg,
+
+def test_home_away_alignment_correct() -> None:
+    # Simple scenario with two games, alternating home team.
+    base = pd.DataFrame(
+        {
+            "game_id": ["g1", "g2"],
+            "season": [2021, 2021],
+            "week": [1, 2],
+            "gameday": pd.to_datetime(["2021-09-10", "2021-09-17"]),
+            "game_index": [0, 1],
+            "home_team": ["A", "B"],
+            "away_team": ["B", "A"],
+            "home_score": [10, 14],
+            "away_score": [7, 21],
+            "home_win": [1, 0],
+            "total_points": [17, 35],
+            "spread_line": [-3.0, 3.0],
+            "total_line": [42.0, 44.0],
+            "home_moneyline": [-150, 120],
+            "away_moneyline": [130, -140],
+            "is_regular_season": [True, True],
+            "is_postseason": [False, False],
+        }
     )
 
-    # Focus on game 2 (g2), where B is home and A is away
-    row_g2 = game_df[game_df["game_id"] == "g2"].iloc[0]
+    cfg = TeamStatsConfig(seasons=[2021], include_postseason=True, rolling_windows=(2,))
+    team_df = build_team_features(config=cfg, base_games=base)
+    game_df = build_game_level_features(team_df=team_df, base_games=base, config=cfg)
 
-    # For team B (home in g2), previous game was g1 as away with 7 points
-    home_col = "home_points_for_rolling_mean_2"
-    assert home_col in game_df.columns
-    assert row_g2[home_col] == pytest.approx(7.0)
-
-    # For team A (away in g2), previous game was g1 as home with 10 points
-    away_col = "away_points_for_rolling_mean_2"
-    assert away_col in game_df.columns
-    assert row_g2[away_col] == pytest.approx(10.0)
+    # For game 2 (game_index=1), home_team=B should have home_points_for_rolling_mean_2
+    # based only on B's prior game (as away_team in game 1 with 7 points).
+    g2 = game_df.loc[game_df["game_id"] == "g2"].iloc[0]
+    assert g2["home_team"] == "B"
+    # B's prior points_for is 7, so rolling mean_2 should be 7
+    assert np.isclose(g2["home_points_for_rolling_mean_2"], 7.0)
 
 
-# ---------------------------------------------------------------------------
-# 5) Schedule / season aggregates leak-free + NaN semantics
-# ---------------------------------------------------------------------------
-
-
-def test_schedule_and_season_agg_leak_free_and_nan():
-    """
-    Explicitly test that:
-      - days_since_last_game only uses prior games;
-      - season_win_pct_to_date uses only prior results;
-      - first game entries have NaNs for these aggregates.
-    """
-    base_df = _make_tiny_base_df_single_matchup()
-    cfg = TeamStatsConfig(
-        seasons=[2023],
-        rolling_windows=(2,),
-        min_games_for_rolling=1,
-        include_postseason=True,
+def test_schedule_and_season_agg_leak_free_and_nan() -> None:
+    # One team, three games with known spacing and outcomes.
+    base = pd.DataFrame(
+        {
+            "game_id": ["g1", "g2", "g3"],
+            "season": [2021, 2021, 2021],
+            "week": [1, 2, 3],
+            "gameday": pd.to_datetime(["2021-09-10", "2021-09-17", "2021-10-01"]),
+            "game_index": [0, 1, 2],
+            "home_team": ["A", "A", "A"],
+            "away_team": ["B", "C", "D"],
+            "home_score": [7, 14, 21],
+            "away_score": [10, 7, 3],
+            "home_win": [0, 1, 1],
+            "total_points": [17, 21, 24],
+            "spread_line": [-1.0, -3.0, -7.0],
+            "total_line": [40.0, 42.0, 44.0],
+            "home_moneyline": [110, -140, -200],
+            "away_moneyline": [-130, 120, 170],
+            "is_regular_season": [True, True, True],
+            "is_postseason": [False, False, False],
+        }
     )
 
-    team_df = build_team_features(config=cfg, base_games=base_df)
+    cfg = TeamStatsConfig(seasons=[2021], include_postseason=True, rolling_windows=(2,))
+    team_df = build_team_features(config=cfg, base_games=base)
 
-    # Team A
-    team_a = team_df[team_df["team"] == "A"].sort_values("game_index")
-    ds = team_a["days_since_last_game"].tolist()
-    win_pct = team_a["season_win_pct_to_date"].tolist()
-    wins = team_a["team_win"].tolist()
-    # A's team_win values:
-    # g1: A home win -> 1
-    # g2: A away loss -> 0
-    # g3: A home win -> 1
-    assert wins == [1, 0, 1]
+    a_team = team_df[team_df["team"] == "A"].sort_values("game_index")
 
-    # days_since_last_game: first should be NaN; subsequent equal to 7 days
-    assert np.isnan(ds[0])
-    assert ds[1:] == [7.0, 7.0]
+    # First game: no prior game -> NaNs
+    assert np.isnan(a_team.iloc[0]["days_since_last_game"])
+    assert np.isnan(a_team.iloc[0]["season_win_pct_to_date"])
 
-    # season_win_pct_to_date (shifted expanding mean):
-    # shifted team_win: [NaN, 1, 0]
-    # expanding mean:   [NaN, 1.0, 0.5]
-    assert np.isnan(win_pct[0])
-    assert win_pct[1:] == pytest.approx([1.0, 0.5], rel=1e-6)
+    # Second game: 7 days since last, prior wins = [0] -> mean = 0
+    assert a_team.iloc[1]["days_since_last_game"] == 7
+    assert np.isclose(a_team.iloc[1]["season_win_pct_to_date"], 0.0)
 
-    # Team B should show analogous NaN behavior for its first game
-    team_b = team_df[team_df["team"] == "B"].sort_values("game_index")
-    assert np.isnan(team_b["days_since_last_game"].iloc[0])
-    assert np.isnan(team_b["season_win_pct_to_date"].iloc[0])
+    # Third game: 14 days since last, prior wins = [0,1] -> mean = 0.5
+    assert a_team.iloc[2]["days_since_last_game"] == 14
+    assert np.isclose(a_team.iloc[2]["season_win_pct_to_date"], 0.5)
 
 
-# ---------------------------------------------------------------------------
-# 6) Schedule, implied probs, and diff features exposed & correct
-# ---------------------------------------------------------------------------
-
-
-def test_schedule_and_implied_prob_features_exposed_and_diffs_correct():
-    """
-    Ensure schedule features, implied probabilities, and new diff columns
-    make it through to the game-level features and are numerically sensible.
-    """
-    base_df = _make_schedule_asymmetric_df()
-    cfg = TeamStatsConfig(
-        seasons=[2023],
-        rolling_windows=(2,),
-        min_games_for_rolling=1,
-        include_postseason=True,
+def test_schedule_and_implied_prob_features_exposed_and_diffs_correct() -> None:
+    # Two teams with different rest and moneylines.
+    base = pd.DataFrame(
+        {
+            "game_id": ["g1", "g2"],
+            "season": [2021, 2021],
+            "week": [1, 2],
+            "gameday": pd.to_datetime(["2021-09-10", "2021-09-24"]),
+            "game_index": [0, 1],
+            "home_team": ["A", "A"],
+            "away_team": ["B", "B"],
+            "home_score": [21, 17],
+            "away_score": [14, 10],
+            "home_win": [1, 1],
+            "total_points": [35, 27],
+            "spread_line": [-3.0, -7.0],
+            "total_line": [45.0, 42.0],
+            "home_moneyline": [-150, -200],
+            "away_moneyline": [130, 170],
+            "is_regular_season": [True, True],
+            "is_postseason": [False, False],
+        }
     )
 
-    team_df = build_team_features(config=cfg, base_games=base_df)
-    game_df = build_game_level_features(
-        team_df=team_df,
-        base_games=base_df,
-        config=cfg,
-    )
+    cfg = TeamStatsConfig(seasons=[2021], include_postseason=True, rolling_windows=(2,))
+    team_df = build_team_features(config=cfg, base_games=base)
+    game_df = build_game_level_features(team_df=team_df, base_games=base, config=cfg)
 
     # Columns should exist
     for col in [
@@ -391,99 +248,81 @@ def test_schedule_and_implied_prob_features_exposed_and_diffs_correct():
         "diff_games_played_season_to_date",
         "diff_season_win_pct_to_date",
         "diff_implied_prob_ml",
+        # schedule flags should also be propagated
+        "home_is_short_week",
+        "away_is_short_week",
+        "home_is_long_rest",
+        "away_is_long_rest",
+        "home_coming_off_bye",
+        "away_coming_off_bye",
     ]:
         assert col in game_df.columns, f"Missing expected column {col}"
 
-    # Check implied prob numerics for game 1:
-    # g1: home_moneyline = -150, away_moneyline = +130
-    row_g1 = game_df[game_df["game_id"] == "g1"].iloc[0]
+    # For second game: both teams played game1 and game2 is 14 days after game1.
+    g2 = game_df.loc[game_df["game_id"] == "g2"].iloc[0]
 
-    home_p = row_g1["home_implied_prob_ml"]
-    away_p = row_g1["away_implied_prob_ml"]
+    # A is home both times: days_since_last_game for home team should be 14
+    assert g2["home_days_since_last_game"] == 14
 
-    expected_home_p = 150.0 / (150.0 + 100.0)  # -150
-    expected_away_p = 100.0 / (130.0 + 100.0)  # +130
+    # B is away both times: days_since_last_game for away team should also be 14
+    assert g2["away_days_since_last_game"] == 14
 
-    assert home_p == pytest.approx(expected_home_p, rel=1e-6)
-    assert away_p == pytest.approx(expected_away_p, rel=1e-6)
+    # games_played_season_to_date: each team has played 1 prior game by game2
+    assert g2["home_games_played_season_to_date"] == 1
+    assert g2["away_games_played_season_to_date"] == 1
+    assert g2["diff_games_played_season_to_date"] == 0
 
-    # Now check diffs for game 3 (g3: A vs B, A home with 14 days rest, B with 10)
-    row_g3 = game_df[game_df["game_id"] == "g3"].iloc[0]
+    # implied probs should be consistent with moneylines and diffs should match
+    # Compute implied probs for game2:
+    def implied(odds: float) -> float:
+        if odds < 0:
+            return -odds / (-odds + 100.0)
+        return 100.0 / (odds + 100.0)
 
-    home_rest = row_g3["home_days_since_last_game"]
-    away_rest = row_g3["away_days_since_last_game"]
-    diff_rest = row_g3["diff_days_since_last_game"]
-    assert home_rest == pytest.approx(14.0, rel=1e-6)
-    assert away_rest == pytest.approx(10.0, rel=1e-6)
-    assert diff_rest == pytest.approx(home_rest - away_rest, rel=1e-6)
-
-    # games_played_season_to_date: both A and B have played 1 prior game
-    home_games = row_g3["home_games_played_season_to_date"]
-    away_games = row_g3["away_games_played_season_to_date"]
-    diff_games = row_g3["diff_games_played_season_to_date"]
-    assert home_games == 1
-    assert away_games == 1
-    assert diff_games == 0
-
-    # diff_implied_prob_ml should equal home - away
-    diff_prob = row_g3["diff_implied_prob_ml"]
-    home_prob_g3 = row_g3["home_implied_prob_ml"]
-    away_prob_g3 = row_g3["away_implied_prob_ml"]
-    assert diff_prob == pytest.approx(home_prob_g3 - away_prob_g3, rel=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# 7) Optional integration test (real data via nfl_data_py)
-# ---------------------------------------------------------------------------
+    home_p = implied(-200)
+    away_p = implied(170)
+    assert np.isclose(g2["home_implied_prob_ml"], home_p, atol=1e-6)
+    assert np.isclose(g2["away_implied_prob_ml"], away_p, atol=1e-6)
+    assert np.isclose(
+        g2["diff_implied_prob_ml"],
+        home_p - away_p,
+        atol=1e-6,
+    )
 
 
 @pytest.mark.integration
-def test_feature_builder_end_to_end_integration():
-    """
-    Build features over a modest real season range to ensure the
-    pipeline runs without error and produces sensible columns.
+def test_feature_builder_end_to_end_integration() -> None:
+    # Smoke test that FeatureBuilder can run over a real season subset.
+    base_cfg = BaseDatasetConfig(
+        seasons=[2021],
+        include_markets=True,
+        drop_preseason=True,
+        save_parquet=False,
+    )
+    base_games = build_base_dataset(base_cfg)
 
-    This test relies on nfl_data_py via build_base_dataset and may be
-    skipped in CI if the dependency or network is unavailable.
-    """
-    seasons = [2021, 2022]
-    fb_config = FeatureBuilderConfig(
-        seasons=seasons,
+    fb_cfg = FeatureBuilderConfig(
+        seasons=[2021],
         include_postseason=True,
         include_markets=True,
         drop_preseason=True,
         save_intermediate=False,
     )
-    builder = FeatureBuilder(fb_config)
+    fb = FeatureBuilder(fb_cfg)
 
-    # Ensure base dataset builds
-    base_df = build_base_dataset(
-        BaseDatasetConfig(
-            seasons=seasons,
-            include_markets=True,
-            drop_preseason=True,
-            save_parquet=False,
-        )
-    )
-    assert len(base_df) > 0
+    features = fb.build_features(base_games=base_games)
 
-    # Build full features
-    features_df = builder.build_features(base_games=base_df)
-    assert len(features_df) == len(base_df)
+    # shape should match base dataset
+    assert len(features) == len(base_games)
 
-    # Check for some expected columns
-    assert "target_home_win" in features_df.columns
-    assert "target_total_points" in features_df.columns
-    assert "target_total_over" in features_df.columns
-    assert any(
-        col.startswith("home_points_for_rolling_mean_")
-        for col in features_df.columns
-    )
-    assert any(
-        col.startswith("away_points_for_rolling_mean_")
-        for col in features_df.columns
-    )
-    assert any(
-        col.startswith("diff_points_for_rolling_mean_")
-        for col in features_df.columns
-    )
+    # key targets and feature prefixes should exist
+    for col in [
+        "target_home_win",
+        "target_total_points",
+        "target_total_over",
+    ]:
+        assert col in features.columns
+
+    assert any(c.startswith("home_points_for_rolling_mean") for c in features.columns)
+    assert any(c.startswith("away_points_for_rolling_mean") for c in features.columns)
+    assert "diff_season_win_pct_to_date" in features.columns

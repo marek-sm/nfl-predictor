@@ -5,11 +5,9 @@ from dataclasses import dataclass
 import pandas as pd
 
 from nfl_predictor.config import DATA_CONFIG
-from nfl_predictor.data.preprocessing.base_dataset import (
-    BaseDatasetConfig,
-    build_base_dataset,
-)
-from nfl_predictor.data.feature_engineering.team_stats_pipeline import (
+from nfl_predictor.data.preprocessing.base_dataset import BaseDatasetConfig, build_base_dataset
+
+from .team_stats_pipeline import (
     TeamStatsConfig,
     build_game_level_features,
     build_team_features,
@@ -21,18 +19,16 @@ class FeatureBuilderConfig:
     """
     Configuration for the high-level feature builder (Step 3 orchestrator).
 
-    Attributes
-    ----------
-    seasons:
-        Seasons to include. If None, uses DATA_CONFIG.default_seasons.
-    include_postseason:
-        Whether to include postseason games in the modeling matrix.
-    include_markets:
-        Whether the base dataset should retain market columns.
-    drop_preseason:
-        Whether to drop preseason games when building the base dataset.
-    save_intermediate:
-        If True, save team-level and game-level feature parquet files.
+    This config acts as the single source of truth for:
+        - seasons included in the dataset,
+        - postseason inclusion,
+        - whether market columns are loaded,
+        - whether preseason is dropped.
+
+    When you call `FeatureBuilder.build_features()`, a compatible
+    BaseDatasetConfig and TeamStatsConfig are created under the hood
+    so that Step 2 (base dataset) and Step 3 (feature engineering)
+    stay in sync.
     """
 
     seasons: list[int] | None = None
@@ -44,30 +40,35 @@ class FeatureBuilderConfig:
 
 class FeatureBuilder:
     """
-    End-to-end orchestration for building modeling features (Step 3).
+    Orchestrates Step 2 (base dataset) and Step 3 (feature engineering)
+    into a single call that returns a one-row-per-game feature matrix.
 
     Typical usage
     -------------
-        config = FeatureBuilderConfig(seasons=list(range(2015, 2024)))
-        builder = FeatureBuilder(config)
-        features_df = builder.build_features()
+    fb_config = FeatureBuilderConfig(seasons=[2021, 2022])
+    fb = FeatureBuilder(fb_config)
+    features_df = fb.build_features()
 
-    This will:
-        - Build the base dataset (Step 2).
-        - Build team-game long features with rolling & schedule stats.
-        - Merge into a game-level modeling matrix with home_/away_ features.
-        - Attach matchup differentials and modeling targets.
+    Notes
+    -----
+    - When using this class, FeatureBuilderConfig is the canonical
+      configuration for the base dataset. Internally, compatible
+      BaseDatasetConfig and TeamStatsConfig instances are derived
+      so that Step 2 and Step 3 remain consistent.
     """
 
-    def __init__(self, config: FeatureBuilderConfig | None = None) -> None:
-        if config is None:
-            config = FeatureBuilderConfig()
+    def __init__(self, config: FeatureBuilderConfig) -> None:
         self.config = config
 
-    # ------------------------------------------------------------------
-    # Helper configuration builders
-    # ------------------------------------------------------------------
     def _make_base_config(self) -> BaseDatasetConfig:
+        """
+        Construct the BaseDatasetConfig used by Step 2 when running
+        FeatureBuilder end-to-end.
+
+        This method defines the canonical configuration for the base
+        dataset whenever FeatureBuilder is used; TeamStatsConfig
+        is derived from this to ensure consistency.
+        """
         seasons = self.config.seasons
         if seasons is None:
             seasons = DATA_CONFIG.default_seasons
@@ -80,8 +81,14 @@ class FeatureBuilder:
         )
 
     def _make_team_config(self) -> TeamStatsConfig:
-        # FeatureBuilder is the "single source of truth" when used end-to-end:
-        # seasons/postseason choices live here and are passed into TeamStatsConfig.
+        """
+        Construct a TeamStatsConfig that is consistent with this
+        FeatureBuilder's BaseDatasetConfig.
+
+        NOTE: When using FeatureBuilder, you should not construct
+        TeamStatsConfig manually; this method ensures that the
+        seasons and postseason settings line up with the base dataset.
+        """
         return TeamStatsConfig(
             seasons=self.config.seasons,
             include_postseason=self.config.include_postseason,
@@ -89,53 +96,36 @@ class FeatureBuilder:
             save_game_level=self.config.save_intermediate,
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    def build_base(self) -> pd.DataFrame:
-        """Build (or rebuild) the base dataset (Step 2)."""
-        return build_base_dataset(self._make_base_config())
-
-    def build_team_features(
-        self,
-        base_games: pd.DataFrame | None = None,
-    ) -> pd.DataFrame:
+    def build_features(self, base_games: pd.DataFrame | None = None) -> pd.DataFrame:
         """
-        Build team-game level features (two rows per game).
+        Build game-level features (one row per game) for modeling.
 
         Parameters
         ----------
         base_games:
-            Optional pre-built base dataset. If None, Step 2 will be run.
-        """
-        team_config = self._make_team_config()
-        return build_team_features(config=team_config, base_games=base_games)
-
-    def build_features(
-        self,
-        base_games: pd.DataFrame | None = None,
-    ) -> pd.DataFrame:
-        """
-        Build the full game-level modeling feature matrix.
+            Optional pre-built base dataset from Step 2. If None, this
+            method will call `build_base_dataset` using the canonical
+            BaseDatasetConfig derived from this FeatureBuilderConfig.
 
         Returns
         -------
         pd.DataFrame
             One row per game with:
-                - original base dataset columns
-                - home_* team rolling/schedule/market features
-                - away_* team rolling/schedule/market features
-                - diff_* matchup features
-                - target_home_win, target_total_points, target_total_over
+                - base dataset columns,
+                - home_* and away_* features,
+                - diff_* matchup features,
+                - modeling targets.
         """
-        if base_games is None:
-            base_games = self.build_base()
+        base_cfg = self._make_base_config()
+        team_cfg = self._make_team_config()
 
-        team_config = self._make_team_config()
-        team_df = build_team_features(config=team_config, base_games=base_games)
-        game_features = build_game_level_features(
+        if base_games is None:
+            base_games = build_base_dataset(base_cfg)
+
+        team_df = build_team_features(config=team_cfg, base_games=base_games)
+        game_df = build_game_level_features(
             team_df=team_df,
             base_games=base_games,
-            config=team_config,
+            config=team_cfg,
         )
-        return game_features
+        return game_df
