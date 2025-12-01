@@ -149,7 +149,7 @@ nfl-predictor/
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/<your-username>/nfl-predictor
+git clone https://github.com/marek-sm/nfl-predictor.git
 cd nfl-predictor
 ```
 
