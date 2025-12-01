@@ -55,6 +55,10 @@ Production-grade team & game-level features including:
 - Points for/against, point differential
 - ATS metrics (`ats_margin`, `covered_spread`)
 - Market-aware features (`implied_prob_ml`, `total_vs_line`)
+- **Elo-style team ratings**:
+  - pre-game `elo` at team level
+  - opponent `opponent_elo`
+  - per-team `elo_diff`
 - Season-to-date stats:
   - `season_win_pct_to_date` (shifted expanding mean)
 - Schedule/rest features:
@@ -84,7 +88,9 @@ Reconstructed into **one row per game**:
   - `diff_point_diff_rolling_mean_*`
   - `diff_season_win_pct_to_date`
   - `diff_days_since_last_game`
+  - `diff_games_played_season_to_date`
   - `diff_implied_prob_ml`
+  - **`diff_elo`**
   - and more…
 
 ### 🎯 Targets
@@ -95,15 +101,16 @@ Reconstructed into **one row per game**:
 
 ### 🧪 Test Suite Includes
 
-- rolling no-leakage tests
-- timing correctness
-- home/away alignment
-- schedule & season aggregate correctness
-- implied probability correctness
-- diff feature correctness
-- end-to-end integration (real `nfl_data_py` schedule data)
+- Rolling no-leakage tests
+- Timing correctness
+- Home/away alignment
+- Schedule & season aggregate correctness
+- Implied probability correctness
+- Elo timing + update correctness
+- Diff feature correctness
+- End-to-end integration (real `nfl_data_py` schedule data)
 
-👉 **23/23 tests passing.**
+👉 **24/24 tests passing.**
 
 ---
 
@@ -180,11 +187,15 @@ pip install -e .
 
 # 🔍 Quick Checks
 
+Run these to sanity-check the whole project:
+
 ```bash
 python run_data_check.py
 python run_base_dataset_check.py
 python run_feature_check.py
 pytest -v
+python -m compileall src
+python -c "import nfl_predictor"
 ```
 
 ---

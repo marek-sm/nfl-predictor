@@ -255,6 +255,10 @@ def test_schedule_and_implied_prob_features_exposed_and_diffs_correct() -> None:
         "away_is_long_rest",
         "home_coming_off_bye",
         "away_coming_off_bye",
+        # Elo should be propagated as well
+        "home_elo",
+        "away_elo",
+        "diff_elo",
     ]:
         assert col in game_df.columns, f"Missing expected column {col}"
 
@@ -326,3 +330,96 @@ def test_feature_builder_end_to_end_integration() -> None:
     assert any(c.startswith("home_points_for_rolling_mean") for c in features.columns)
     assert any(c.startswith("away_points_for_rolling_mean") for c in features.columns)
     assert "diff_season_win_pct_to_date" in features.columns
+
+    # Elo should be available at game level
+    assert "home_elo" in features.columns
+    assert "away_elo" in features.columns
+    assert "diff_elo" in features.columns
+
+
+def test_elo_ratings_leak_free_and_update_correct():
+    """
+    Elo ratings should:
+      - start at the base rating for a team's first game,
+      - update only based on PAST games,
+      - match the standard Elo update formula using config parameters.
+    """
+    import pytest
+
+    # Simple 2-game season:
+    # Game 1: A (home) vs B, A wins
+    # Game 2: A (home) vs B, A wins again
+    base = pd.DataFrame(
+        {
+            "game_id": ["g1", "g2"],
+            "season": [2021, 2021],
+            "week": [1, 2],
+            "gameday": pd.to_datetime(["2021-09-10", "2021-09-17"]),
+            "game_index": [0, 1],
+            "home_team": ["A", "A"],
+            "away_team": ["B", "B"],
+            "home_score": [21, 24],
+            "away_score": [14, 17],
+            "home_win": [1, 1],
+            "total_points": [35, 41],
+            "spread_line": [-3.0, -6.5],
+            "total_line": [45.0, 44.5],
+            "home_moneyline": [-150, -180],
+            "away_moneyline": [130, 160],
+            "is_regular_season": [True, True],
+            "is_postseason": [False, False],
+        }
+    )
+
+    # Use known Elo parameters
+    elo_base = 1500.0
+    elo_k = 20.0
+    elo_hfa = 55.0
+
+    cfg = TeamStatsConfig(
+        seasons=[2021],
+        include_postseason=True,
+        rolling_windows=(1,),
+        min_games_for_rolling=1,
+        use_elo=True,
+        elo_base=elo_base,
+        elo_k=elo_k,
+        elo_home_field_advantage=elo_hfa,
+    )
+
+    team_df = build_team_features(config=cfg, base_games=base)
+
+    # Focus on team A's rows, sorted by game_index
+    team_a = team_df[team_df["team"] == "A"].sort_values("game_index")
+    assert len(team_a) == 2
+
+    # Pre-game Elo for A before Game 1 should be the base rating
+    elo_g1 = float(team_a.iloc[0]["elo"])
+    assert elo_g1 == pytest.approx(elo_base, rel=1e-6)
+
+    # Compute expected Elo for A BEFORE Game 2 using standard Elo update
+    r_home = elo_base
+    r_away = elo_base
+    diff = (r_home + elo_hfa) - r_away
+    expected_home_prob = 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
+
+    s_home = 1.0  # A won
+    elo_after_g1 = r_home + elo_k * (s_home - expected_home_prob)
+
+    # Pre-game Elo for A before Game 2 should equal elo_after_g1
+    elo_g2 = float(team_a.iloc[1]["elo"])
+    assert elo_g2 == pytest.approx(elo_after_g1, rel=1e-6)
+
+    # Also check team B for symmetry
+    team_b = team_df[team_df["team"] == "B"].sort_values("game_index")
+    assert len(team_b) == 2
+
+    elo_b_g1 = float(team_b.iloc[0]["elo"])
+    elo_b_g2 = float(team_b.iloc[1]["elo"])
+
+    # B starts at base
+    assert elo_b_g1 == pytest.approx(elo_base, rel=1e-6)
+
+    # B's rating moves opposite to A's change
+    elo_b_after_g1 = r_away - elo_k * (s_home - expected_home_prob)
+    assert elo_b_g2 == pytest.approx(elo_b_after_g1, rel=1e-6)

@@ -143,16 +143,22 @@ def add_rolling_features(
 
         return g
 
-    result = (
-        result.groupby(group_cols_list, group_keys=False, sort=False)
-        # NOTE: We intentionally do not pass `include_groups=False` here to
-        # keep compatibility with a broad range of pandas versions. The
-        # default behavior is compatible with our usage, even though newer
-        # pandas versions may emit a FutureWarning about group columns.
-        .apply(_apply_all_specs)
+    # Avoid FutureWarning from DataFrameGroupBy.apply by explicitly
+    # iterating over groups instead of relying on the older apply
+    # semantics with grouping columns included.
+    grouped = (
+        df.sort_values(time_col)
+        .groupby(group_cols, group_keys=False, sort=False)
     )
 
-    # Restore original row order
-    result = result.loc[original_index]
+    parts: list[pd.DataFrame] = []
+    for _, group in grouped:
+        parts.append(_apply_all_specs(group))
+
+    result = pd.concat(parts, axis=0)
+
+    # Preserve original row order by index (to match prior behavior
+    # and keep downstream joins predictable).
+    result = result.sort_index()
 
     return result

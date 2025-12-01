@@ -47,15 +47,15 @@ class TeamStatsConfig:
         If True, save team-game features to DATA_CONFIG.features_dir.
     save_game_level:
         If True, save game-level features to DATA_CONFIG.features_dir.
-
-    Usage notes
-    -----------
-    - In typical end-to-end usage, you should not construct this
-      manually; instead use FeatureBuilder, which creates a consistent
-      TeamStatsConfig based on its own FeatureBuilderConfig.
-    - `make_base_config()` is primarily a convenience for standalone
-      / testing usage where you want to call build_team_features
-      directly.
+    use_elo:
+        Whether to compute and include Elo-style team ratings.
+    elo_base:
+        Initial Elo rating for each team at the start of a season.
+    elo_k:
+        K-factor controlling the magnitude of Elo updates per game.
+    elo_home_field_advantage:
+        Home-field advantage in Elo points added to the home team's rating
+        when computing expected results.
     """
 
     seasons: list[int] | None = None
@@ -64,6 +64,12 @@ class TeamStatsConfig:
     min_games_for_rolling: int = 1
     save_team_level: bool = False
     save_game_level: bool = False
+
+    # Elo configuration
+    use_elo: bool = True
+    elo_base: float = 1500.0
+    elo_k: float = 20.0
+    elo_home_field_advantage: float = 55.0
 
     def make_base_config(self) -> BaseDatasetConfig:
         """
@@ -101,6 +107,58 @@ def _american_odds_to_prob(odds: float | int | None) -> float | None:
     return 100.0 / (odds + 100.0)
 
 
+def _add_elo_ratings(base_games: pd.DataFrame, config: TeamStatsConfig) -> pd.DataFrame:
+    """
+    Add leak-free pre-game Elo ratings for home and away teams.
+
+    Elo is computed separately for each season, iterating games in
+    chronological order using `game_index`. For each game:
+
+    - home_elo_pre / away_elo_pre are the Elo ratings BEFORE the game.
+    - Ratings are then updated based on the game result.
+
+    This guarantees that for game i, Elo only depends on games < i
+    within the same season (no future information).
+    """
+    df = base_games.copy()
+    df["home_elo_pre"] = np.nan
+    df["away_elo_pre"] = np.nan
+
+    base_rating = float(config.elo_base)
+    k = float(config.elo_k)
+    hfa = float(config.elo_home_field_advantage)
+
+    for season in sorted(df["season"].unique()):
+        mask = df["season"] == season
+        season_games = df.loc[mask].sort_values("game_index")
+
+        ratings: dict[str, float] = {}
+
+        for idx, row in season_games.iterrows():
+            home = row["home_team"]
+            away = row["away_team"]
+
+            r_home = ratings.get(home, base_rating)
+            r_away = ratings.get(away, base_rating)
+
+            # store pre-game Elo
+            df.at[idx, "home_elo_pre"] = r_home
+            df.at[idx, "away_elo_pre"] = r_away
+
+            # expected home win probability using logistic Elo
+            diff = (r_home + hfa) - r_away
+            exp_home = 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
+
+            # actual result
+            s_home = float(row["home_win"])  # 1.0 or 0.0
+
+            change = k * (s_home - exp_home)
+            ratings[home] = r_home + change
+            ratings[away] = r_away - change
+
+    return df
+
+
 def _build_team_long_from_base(base_games: pd.DataFrame) -> pd.DataFrame:
     """
     Expand one-row-per-game base dataset into two-row-per-game team-long format.
@@ -111,7 +169,11 @@ def _build_team_long_from_base(base_games: pd.DataFrame) -> pd.DataFrame:
     - team_win (1/0)
     - ats_margin, covered_spread
     - total_vs_line
-    - team_moneyline, implied_prob_ml
+    - implied_prob_ml from team_moneyline
+    - (if available) Elo-based features:
+        * elo  (team pre-game Elo)
+        * opponent_elo
+        * elo_diff (team elo - opponent elo)
     """
     # home rows
     home = base_games.copy()
@@ -133,14 +195,21 @@ def _build_team_long_from_base(base_games: pd.DataFrame) -> pd.DataFrame:
     away["team_win"] = 1 - away["home_win"]
     away["team_moneyline"] = away["away_moneyline"]
 
+    # If Elo has been computed at game level (home_elo_pre / away_elo_pre),
+    # propagate to team perspective.
+    if "home_elo_pre" in base_games.columns and "away_elo_pre" in base_games.columns:
+        home["elo"] = home["home_elo_pre"]
+        home["opponent_elo"] = home["away_elo_pre"]
+
+        away["elo"] = away["away_elo_pre"]
+        away["opponent_elo"] = away["home_elo_pre"]
+
     team_df = pd.concat([home, away], ignore_index=True)
 
     # basic derived stats
     team_df["point_diff"] = team_df["points_for"] - team_df["points_against"]
 
     # spread from the perspective of the team row
-    # positive spread_line means home is favored by that many points.
-    # For away teams, the effective spread is -spread_line.
     team_df["spread_from_team"] = np.where(
         team_df["is_home"],
         team_df["spread_line"],
@@ -154,6 +223,10 @@ def _build_team_long_from_base(base_games: pd.DataFrame) -> pd.DataFrame:
 
     # implied probability from team_moneyline
     team_df["implied_prob_ml"] = team_df["team_moneyline"].map(_american_odds_to_prob)
+
+    # Elo differentials at team level (if available)
+    if "elo" in team_df.columns and "opponent_elo" in team_df.columns:
+        team_df["elo_diff"] = team_df["elo"] - team_df["opponent_elo"]
 
     return team_df
 
@@ -170,32 +243,29 @@ def _add_schedule_features(team_df: pd.DataFrame) -> pd.DataFrame:
     - coming_off_bye (>= 13 days)
     - season_win_pct_to_date (shifted expanding mean of team_win)
     """
-    df = team_df.sort_values(["team", "season", "gameday"]).copy()
+    # Ensure correct chronological order within each team/season
+    df = team_df.sort_values(["team", "season", "gameday", "game_index"]).copy()
 
-    # days since last game (within same team/season)
-    df["days_since_last_game"] = (
-        df.groupby(["team", "season"])["gameday"]
-        .diff()
-        .dt.days
-    )
+    group = df.groupby(["team", "season"], group_keys=False)
 
-    # games played so far this season (0-based, then add 1 if you want game number)
-    df["games_played_season_to_date"] = (
-        df.groupby(["team", "season"]).cumcount()
-    )
+    # Days since last game (within same team/season)
+    df["days_since_last_game"] = group["gameday"].diff().dt.days
 
-    # schedule flags
-    df["is_short_week"] = (df["days_since_last_game"] <= 4).astype(float)
-    df["is_long_rest"] = (df["days_since_last_game"] >= 10).astype(float)
-    df["coming_off_bye"] = (df["days_since_last_game"] >= 13).astype(float)
+    # Games played so far this season (0-based count of prior games)
+    df["games_played_season_to_date"] = group.cumcount()
 
-    # season win pct to date (expanding mean of prior team_win)
-    df["season_win_pct_to_date"] = (
-        df.groupby(["team", "season"])["team_win"]
-        .shift(1)
-        .expanding()
-        .mean()
-    )
+    # Schedule flags
+    ds = df["days_since_last_game"]
+    df["is_short_week"] = (ds <= 4).astype(float)
+    df["is_long_rest"] = (ds >= 10).astype(float)
+    df["coming_off_bye"] = (ds >= 13).astype(float)
+
+    # Season win% to date (expanding mean of prior team_win only, per team/season)
+    def _season_win_pct(s: pd.Series) -> pd.Series:
+        shifted = s.shift(1)  # drop current game from its own aggregate
+        return shifted.expanding(min_periods=1).mean()
+
+    df["season_win_pct_to_date"] = group["team_win"].apply(_season_win_pct)
 
     return df
 
@@ -295,6 +365,10 @@ def build_team_features(
     if not config.include_postseason:
         df = df[df["is_regular_season"]].copy()
 
+    # Optional Elo ratings at game level (become team features downstream).
+    if config.use_elo:
+        df = _add_elo_ratings(df, config)
+
     team_df = _build_team_long_from_base(df)
     team_df = _add_schedule_features(team_df)
     team_df = _add_rolling_stats(team_df, config)
@@ -368,6 +442,9 @@ def build_game_level_features(
         "away_moneyline",
         "is_regular_season",
         "is_postseason",
+        # game-level Elo pre columns (if present) are not used directly
+        "home_elo_pre",
+        "away_elo_pre",
     } & set(team_df.columns)
 
     feature_cols = sorted(col for col in team_df.columns if col not in identity_cols)
@@ -461,6 +538,10 @@ def build_game_level_features(
         "away_implied_prob_ml",
         "diff_implied_prob_ml",
     )
+
+    # Elo differential at game level
+    _maybe_add_diff("home_elo", "away_elo", "diff_elo")
+
 
     # targets
     game_df["target_home_win"] = game_df["home_win"]
