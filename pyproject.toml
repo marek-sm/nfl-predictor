@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "nfl-predictor"
+version = "0.1.0"
+description = "NFL prediction system (moneyline + totals) with strict anti-leakage."
+authors = ["Marek Seablom-Michel"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pandas = "^2.0.0"
+numpy = "^1.26.0"
+scikit-learn = "^1.4.0"
+xgboost = "^2.0.0"
+nfl-data-py = "^0.3.0"
+pyarrow = "^17.0.0"
+mlflow = "^2.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+black = "^24.0.0"
+isort = "^5.13.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+markers = [
+    "integration: marks tests as integration tests (may be slow or hit external services)"
+]
