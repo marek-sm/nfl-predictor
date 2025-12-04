@@ -23,7 +23,13 @@ import pandas as pd
 from nfl_predictor.config import DATA_CONFIG
 from nfl_predictor.data.preprocessing.base_dataset import BaseDatasetConfig, build_base_dataset
 
+from nfl_predictor.data.feature_engineering.epa_features import (
+    build_team_epa_features,
+    EPAFeaturesConfig,
+)
+
 from .rolling_features import RollingSpec, add_rolling_features
+from .epa_features import build_team_epa_features, EPAFeaturesConfig
 
 
 @dataclass
@@ -70,6 +76,12 @@ class TeamStatsConfig:
     elo_base: float = 1500.0
     elo_k: float = 20.0
     elo_home_field_advantage: float = 55.0
+
+    # nflreadpy / pbp features toggle
+    use_pbp_features: bool = False
+    min_games_for_rolling_epa: int = 3
+
+    normalize_epa_by_season: bool = False
 
     def make_base_config(self) -> BaseDatasetConfig:
         """
@@ -324,12 +336,71 @@ def _add_rolling_stats(team_df: pd.DataFrame, config: TeamStatsConfig) -> pd.Dat
         ),
     ]
 
+    # Optional EPA / pbp-derived rolling features
+    if config.use_pbp_features:
+        epa_cols = [
+            "off_epa_per_play",
+            "off_pass_epa_per_play",
+            "off_rush_epa_per_play",
+            "off_success_rate",
+            "off_explosive_play_rate",
+            "def_epa_per_play_allowed",
+            "def_pass_epa_per_play_allowed",
+            "def_rush_epa_per_play_allowed",
+            "def_success_rate_allowed",
+            "def_explosive_play_rate_allowed",
+        ]
+        for col in epa_cols:
+            if col in team_df.columns:
+                specs.append(
+                    RollingSpec(
+                        col=col,
+                        windows=windows,
+                        stats=("mean",),
+                        min_periods=min_periods,
+                    )
+                )
+
+            # OPTIONAL: rolling stats for season-normalized EPA (z-scores)
+        if config.use_pbp_features and config.normalize_epa_by_season:
+            epa_z_cols = [
+                "off_epa_per_play_z",
+                "off_pass_epa_per_play_z",
+                "off_rush_epa_per_play_z",
+                "def_epa_per_play_allowed_z",
+                "def_pass_epa_per_play_allowed_z",
+                "def_rush_epa_per_play_allowed_z",
+            ]
+            for col in epa_z_cols:
+                if col in team_df.columns:
+                    specs.append(
+                        RollingSpec(
+                            col=col,
+                            windows=windows,
+                            stats=("mean",),
+                            min_periods=min_periods,
+                        )
+                    )
+
     rolled = add_rolling_features(
         df=team_df,
         group_cols=["team", "season"],
         time_col="game_index",
         specs=specs,
     )
+
+    if config.use_pbp_features:
+        min_n = config.min_games_for_rolling_epa
+
+    for col in rolled.columns:
+        if "epa" in col and "rolling" in col:
+            # compute number of previous games per team-season
+            prev_games = (
+                rolled.groupby(["team", "season"])["game_index"]
+                .rank(method="first") - 1
+            )
+            rolled.loc[prev_games < min_n, col] = pd.NA
+
     return rolled
 
 
@@ -343,8 +414,7 @@ def build_team_features(
     Parameters
     ----------
     config:
-        TeamStatsConfig controlling rolling windows, seasons, and
-        saving behavior.
+        TeamStatsConfig controlling seasons, rolling windows, and saving behavior.
     base_games:
         Optional pre-built base dataset from Step 2. If None, this
         function will call `build_base_dataset(config.make_base_config())`.
@@ -369,8 +439,50 @@ def build_team_features(
     if config.use_elo:
         df = _add_elo_ratings(df, config)
 
+    # Base team-long frame (one row per team per game)
     team_df = _build_team_long_from_base(df)
+
+    # Optional PBP / EPA features (team-game level) merged in BEFORE rolling.
+    if config.use_pbp_features:
+        epa_cfg = EPAFeaturesConfig(seasons=config.seasons)
+        epa_df = build_team_epa_features(base_games=df, config=epa_cfg)
+
+        team_df = team_df.merge(
+            epa_df,
+            on=["season", "team", "game_id"],
+            how="left",
+            validate="one_to_one",
+        )
+
+        # Optional: per-season normalization of EPA (z-scores)
+    if config.use_pbp_features and config.normalize_epa_by_season:
+        epa_raw_cols = [
+            "off_epa_per_play",
+            "off_pass_epa_per_play",
+            "off_rush_epa_per_play",
+            "def_epa_per_play_allowed",
+            "def_pass_epa_per_play_allowed",
+            "def_rush_epa_per_play_allowed",
+        ]
+
+        for col in epa_raw_cols:
+            if col in team_df.columns:
+                z_col = f"{col}_z"
+                team_df[z_col] = (
+                    team_df.groupby("season")[col]
+                    .transform(
+                        lambda x: (x - x.mean())
+                        / (x.std(ddof=0) + 1e-8)
+                    )
+                )
+
+    if "pbp_coverage_flag" not in team_df.columns:
+        team_df["pbp_coverage_flag"] = False
+
+    # Schedule / rest features
     team_df = _add_schedule_features(team_df)
+
+    # Rolling stats (including EPA if enabled)
     team_df = _add_rolling_stats(team_df, config)
 
     if config.save_team_level:
@@ -467,6 +579,18 @@ def build_game_level_features(
         if col_home in game_df.columns and col_away in game_df.columns:
             game_df[col_out] = game_df[col_home] - game_df[col_away]
 
+    if config.use_pbp_features:
+        if "home_pbp_coverage_flag" in game_df.columns and "away_pbp_coverage_flag" in game_df.columns:
+            game_df["home_pbp_coverage"] = (
+                game_df["home_pbp_coverage_flag"].fillna(False).astype(bool)
+            )
+            game_df["away_pbp_coverage"] = (
+                game_df["away_pbp_coverage_flag"].fillna(False).astype(bool)
+            )
+            game_df["both_teams_have_pbp"] = (
+                game_df["home_pbp_coverage"] & game_df["away_pbp_coverage"]
+            )
+
     # points_for rolling means
     _maybe_add_diff(
         "home_points_for_rolling_mean_3",
@@ -521,6 +645,31 @@ def build_game_level_features(
         "away_covered_spread_rate_rolling_mean_5",
         "diff_covered_spread_rate_rolling_mean_5",
     )
+
+        # EPA-based matchup differentials (offense & defense)
+    if config.use_pbp_features:
+        for window in (3, 5):  # mirrors existing pattern of diff windows
+            _maybe_add_diff(
+                f"home_off_epa_per_play_rolling_mean_{window}",
+                f"away_off_epa_per_play_rolling_mean_{window}",
+                f"diff_off_epa_per_play_rolling_mean_{window}",
+            )
+            _maybe_add_diff(
+                f"home_def_epa_per_play_allowed_rolling_mean_{window}",
+                f"away_def_epa_per_play_allowed_rolling_mean_{window}",
+                f"diff_def_epa_per_play_allowed_rolling_mean_{window}",
+            )
+            _maybe_add_diff(
+                f"home_off_success_rate_rolling_mean_{window}",
+                f"away_off_success_rate_rolling_mean_{window}",
+                f"diff_off_success_rate_rolling_mean_{window}",
+            )
+            _maybe_add_diff(
+                f"home_def_success_rate_allowed_rolling_mean_{window}",
+                f"away_def_success_rate_allowed_rolling_mean_{window}",
+                f"diff_def_success_rate_allowed_rolling_mean_{window}",
+            )
+
 
     # schedule & market context
     _maybe_add_diff(
