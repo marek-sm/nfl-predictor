@@ -18,9 +18,7 @@ Built with **strict anti-leakage**, **chronological ordering**, and **modular ar
 - Clean ingestion of:
   - scores, matchups, dates
   - `spread_line`, `total_line`, moneylines & odds
-- Target creation:
-  - `home_win`
-  - `total_points`
+- Target creation (`home_win`, `total_points`)
 - Full data quality suite:
   - duplicate detection
   - null checks
@@ -42,56 +40,47 @@ Built with **strict anti-leakage**, **chronological ordering**, and **modular ar
 - `split_by_season()`:
   - walk-forward time splits
   - **no future information leakage**
-  - validated via tests (time ordering, season isolation)
+  - validated via time-based tests
 
 ---
 
 ## ✔ STEP 3 — Feature Engineering (Leak-Free)
 
-Production-grade team & game-level features including:
-
-### 🔧 Team-Long Features (one row per team per game)
+### 🔧 Team-Level Features
 
 - Points for/against, point differential
-- ATS metrics (`ats_margin`, `covered_spread`)
-- Market-aware features (`implied_prob_ml`, `total_vs_line`)
-- **Elo-style team ratings**:
-  - pre-game `elo` at team level
-  - opponent `opponent_elo`
-  - per-team `elo_diff`
-- Season-to-date stats:
-  - `season_win_pct_to_date` (shifted expanding mean)
-- Schedule/rest features:
+- ATS metrics
+- Market-aware features
+- **Elo ratings (pre-game)**
+- Season-to-date:
+  - `season_win_pct_to_date`
+  - games played
+- Rest/schedule:
   - `days_since_last_game`
-  - `games_played_season_to_date`
   - `is_short_week`, `is_long_rest`, `coming_off_bye`
 
 ### 📈 Rolling Features (leak-free)
 
-Grouped by `["team", "season"]` with `shift(1)`:
+All rolling features use **groupby(team, season) + shift(1)**:
 
-- `points_for_rolling_mean/sum_{3,5,8}`
-- `points_against_rolling_mean/sum_{3,5,8}`
-- `point_diff_rolling_mean_*`
-- `ats_margin_rolling_mean_*`
-- `total_vs_line_rolling_mean_*`
-- `team_win_rate_rolling_mean_*`
-- `covered_spread_rate_rolling_mean_*`
+- Rolling mean/sum of points for/against
+- Rolling point differential
+- Rolling ATS margin
+- Rolling total-vs-line
+- Rolling win rate
+- Rolling covered-spread rate
 
 ### 🏟 Game-Level Features
 
-Reconstructed into **one row per game**:
+Each game is reconstructed with:
 
-- `home_*` and `away_*` versions of all team-level features
-- Matchup differential features:
+- `home_*` and `away_*` versions of all team stats
+- Differential features like:
   - `diff_points_for_rolling_mean_*`
-  - `diff_point_diff_rolling_mean_*`
   - `diff_season_win_pct_to_date`
   - `diff_days_since_last_game`
-  - `diff_games_played_season_to_date`
   - `diff_implied_prob_ml`
   - **`diff_elo`**
-  - and more…
 
 ### 🎯 Targets
 
@@ -101,16 +90,14 @@ Reconstructed into **one row per game**:
 
 ### 🧪 Test Suite Includes
 
-- Rolling no-leakage tests
-- Timing correctness
+- No-leakage tests (rolling + Elo)
 - Home/away alignment
-- Schedule & season aggregate correctness
-- Implied probability correctness
-- Elo timing + update correctness
-- Diff feature correctness
-- End-to-end integration (real `nfl_data_py` schedule data)
+- Schedule rest correctness
+- Market implied probability correctness
+- Differential feature correctness
+- End-to-end base dataset → features pipeline validation
 
-👉 **24/24 tests passing.**
+✔ **24/24 tests passing — 85% coverage**
 
 ---
 
@@ -145,91 +132,96 @@ nfl-predictor/
 ├── run_feature_check.py
 │
 ├── pyproject.toml
-├── requirements.txt
+├── poetry.lock
 └── README.md
 ```
 
 ---
 
-# 🛠 Installation
+# 🛠 Installation (Poetry Workflow)
 
-### 1. Clone the repo
+## 1. Clone the repo
 
 ```bash
 git clone https://github.com/marek-sm/nfl-predictor.git
 cd nfl-predictor
 ```
 
-### 2. Create a virtual environment
-
-**Windows:**
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-**Mac/Linux:**
+## 2. Install dependencies with Poetry
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+poetry install
 ```
 
-### 3. Install dependencies
+This will:
+
+- Create/activate a project-specific virtual environment
+- Install all dependencies from `pyproject.toml` and `poetry.lock`
+
+## 3. Activate the virtual environment
+
+Poetry 2.x:
 
 ```bash
-pip install -r requirements.txt
-pip install -e .
+poetry env activate
+```
+
+Verify:
+
+```bash
+python -c "import sys; print(sys.executable)"
 ```
 
 ---
 
 # 🔍 Quick Checks
 
-Run these to sanity-check the whole project:
+Run full sanity checks:
 
 ```bash
-python run_data_check.py
-python run_base_dataset_check.py
-python run_feature_check.py
-pytest -v
-python -m compileall src
-python -c "import nfl_predictor"
+poetry run python run_data_check.py
+poetry run python run_base_dataset_check.py
+poetry run python run_feature_check.py
+poetry run pytest -v
+poetry run python -m compileall src
+poetry run python -c "import nfl_predictor"
 ```
+
+All tests should pass with no leakage and correct feature shaping.
 
 ---
 
 # 🧠 Design Philosophy
 
 - Zero leakage
+- Deterministic, reproducible builds
 - Test-driven development
 - Modular, extensible architecture
-- Realistic sportsbook pipeline (moneylines, spreads, totals)
-- Production-grade code structure
+- Sportsbook-aligned modeling (moneylines, totals, spreads)
+- Production-grade engineering practices
 
 ---
 
 # 🛣 Roadmap
 
-### **Step 4 — Modeling**
+## **Step 4 — Modeling**
 
-- Moneyline (XGBoostClassifier)
-- Totals (XGBoostRegressor + Classifier)
-- Calibration (isotonic)
+- Moneyline (`XGBoostClassifier`)
+- Totals (`XGBoostRegressor` + O/U classifier)
+- Probability calibration (isotonic regression)
 
-### **Step 5 — Weekly Predictions**
+## **Step 5 — Weekly Predictions**
 
-- Automated market ingestion
+- Automatic market ingestion
 - Feature generation
-- Discord webhook output
-- Confidence tiering
-- Model versioning
+- Discord webhook outputs
+- Model versioning & logging
+- Confidence tiering + model agreement
 
-### **Step 6 — Distribution Modeling**
+## **Step 6 — Distribution Modeling**
 
 - Residual bootstrapping
-- PDF/CDF of totals
+- PDFs / CDFs of totals
 - Alternate line projections
 
 ---
